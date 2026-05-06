@@ -1,0 +1,20 @@
+# dns_overrides.yaml — MAC address -> DNS label
+#
+# Copy this file to dns_overrides.yaml (or any path you like), point the
+# DNS_OVERRIDES_FILE env var at it, and the dashboard will use these
+# labels in place of whatever name the FRITZ!Box reports for each device.
+#
+# Useful for devices whose Fritzbox name is junk like "ESP_4F3A21" or
+# generic like "iPhone" — pin them to a stable, sensible label here.
+#
+# - Top level is a flat mapping. No nesting.
+# - Keys are MAC addresses. Quote them — YAML's bare-scalar rules around
+#   colons get fiddly otherwise.
+# - Casing in the YAML doesn't matter; the loader uppercases keys to
+#   match what the FRITZ!Box returns.
+# - Labels follow RFC 1035: letters, digits, hyphens. They're not
+#   re-sanitized, so type them the way you want them in DNS.
+
+"AA:BB:CC:DD:EE:FF": kitchen-sensor
+"11:22:33:44:55:66": hallway-pi
+"DE:AD:BE:EF:00:01": living-room-tv

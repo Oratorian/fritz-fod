@@ -1,0 +1,29 @@
+# FOD — FRITZ!Box Overengineered Dashboard
+# Tested with Python 3.12+
+
+# TR-064 client — talks to the FRITZ!Box. Used by all three scripts.
+fritzconnection~=1.15
+
+# DNS dynamic updates and zone transfers. Required by dns_sync.py.
+dnspython~=2.7
+
+# TUI framework — both dashboards (Grafana + Neo). Watchtool doesn't need it.
+# Pinned tighter because Textual's API changes between minor versions.
+textual~=8.0
+
+# HTTP for the Discord webhook in fritz_watchtool.py.
+requests~=2.32
+
+# Loads a .env file alongside each script so you don't need to export env vars
+# manually. Real shell env vars still take precedence.
+python-dotenv~=1.0
+
+# Parses dns_overrides.yaml — a flat MAC -> DNS-label mapping consumed by
+# both dashboards. Imported lazily, so it's only required if you actually
+# point DNS_OVERRIDES_FILE at a file.
+PyYAML~=6.0
+
+# Windows-only: desktop toast notifications in fritz_watchtool.py.
+# Skipped on Linux/macOS — the watchtool checks at import time and degrades
+# gracefully.
+winotify~=1.1; sys_platform == "win32"
