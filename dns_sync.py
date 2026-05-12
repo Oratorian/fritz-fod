@@ -23,6 +23,7 @@ tuple — typically loaded once at startup from the BIND-style key file.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
 from dataclasses import dataclass, field
@@ -159,6 +160,60 @@ def build_desired(
 
 
 # ---------------------------------------------------------------------------
+# Reverse-zone helpers (PTR sync)
+# ---------------------------------------------------------------------------
+
+
+def reverse_zone_to_network(reverse_zone: str) -> ipaddress.IPv4Network:
+    """Parse a /24 in-addr.arpa zone name into the IPv4 subnet it covers.
+
+    ``"178.168.192.in-addr.arpa"`` -> ``IPv4Network("192.168.178.0/24")``.
+
+    Only classful /24 reverse zones are supported. Classless reverse
+    delegation (RFC 2317) is a swamp this script doesn't wade into.
+    """
+    label = reverse_zone.rstrip(".").lower()
+    if not label.endswith(".in-addr.arpa"):
+        raise ValueError(f"not an IPv4 reverse zone: {reverse_zone}")
+    prefix = label[: -len(".in-addr.arpa")]
+    octets = prefix.split(".")
+    if len(octets) != 3 or not all(o.isdigit() for o in octets):
+        raise ValueError(
+            f"only /24 reverse zones supported (need 3 numeric octets): {reverse_zone}"
+        )
+    return ipaddress.IPv4Network(f"{'.'.join(reversed(octets))}.0/24")
+
+
+def build_desired_ptr(
+    desired_forward: dict[str, str],
+    *,
+    forward_zone: str,
+    reverse_network: ipaddress.IPv4Network,
+) -> dict[str, str]:
+    """Project the forward {label: ip} map into {ptr_label: target_fqdn}.
+
+    For a /24 zone the PTR label is just the host octet. Hosts whose IP
+    isn't in ``reverse_network`` are skipped — they belong to a reverse
+    zone we're not managing. Targets are returned fully qualified with
+    trailing dot, matching what ``rdata.to_text()`` yields from AXFR so
+    diffing compares apples to apples.
+    """
+    out: dict[str, str] = {}
+    zone_fqdn = forward_zone.rstrip(".") + "."
+    for label, ip in desired_forward.items():
+        try:
+            addr = ipaddress.IPv4Address(ip)
+        except ValueError:
+            log.warning("skipping non-IPv4 address for %s: %s", label, ip)
+            continue
+        if addr not in reverse_network:
+            continue
+        ptr_label = str(addr).rsplit(".", 1)[-1]
+        out[ptr_label] = f"{label}.{zone_fqdn}"
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Pulling current state from BIND via AXFR
 # ---------------------------------------------------------------------------
 
@@ -169,12 +224,15 @@ def pull_current(
     timeout: float = 5.0,
     keyring=None,
     keyalgorithm=dns.tsig.HMAC_SHA256,
+    rdtype: str = "A",
 ) -> dict[str, str]:
-    """Read all A records from a zone via AXFR.
+    """Read all records of ``rdtype`` from a zone via AXFR.
 
-    Returns {label: ip}. Empty dict if the zone is empty or transfer fails.
-    Records at the zone apex (SOA, NS) are skipped — we only manage
-    immediate child labels.
+    Returns {label: value}. ``value`` is the IP for A records and the
+    target FQDN (with trailing dot) for PTR records — whatever
+    ``rdata.to_text()`` produces. Empty dict if the zone is empty or
+    transfer fails. Records at the zone apex (SOA, NS) are skipped — we
+    only manage immediate child labels.
 
     If keyring is provided, the AXFR is TSIG-signed (required if BIND has
     `allow-transfer { key foo; };`).
@@ -194,14 +252,14 @@ def pull_current(
         return {}
 
     out: dict[str, str] = {}
-    for name, _ttl, rdata in z.iterate_rdatas("A"):
+    for name, _ttl, rdata in z.iterate_rdatas(rdtype):
         # Skip the zone apex; we only manage child labels.
         label = name.to_text().rstrip(".")
         if label == "@" or label == "":
             continue
-        # Take the first A if there are multiple (unusual for our case).
+        # Take the first record if there are multiple (unusual for our case).
         if label not in out:
-            out[label] = rdata.address
+            out[label] = rdata.to_text()
     return out
 
 
@@ -311,12 +369,17 @@ def apply_diff(
     keyalgorithm=dns.tsig.HMAC_SHA256,
     timeout: float = 10.0,
     dry_run: bool = False,
+    rdtype: str = "A",
 ) -> None:
     """Apply a diff atomically as a single DNS UPDATE message.
 
     All changes go in one transaction (RFC 2136), so either everything
     lands or nothing does. Updates are expressed as delete-then-add per
     convention. Uses dnspython natively — no nsupdate binary required.
+
+    ``rdtype`` selects which record type to manipulate: ``"A"`` for the
+    forward zone (default), ``"PTR"`` for the reverse zone. The diff
+    values are the record data (IPs for A, target FQDNs for PTR).
     """
     if diff.empty:
         return
@@ -324,12 +387,12 @@ def apply_diff(
     upd = dns.update.Update(zone, keyring=keyring, keyalgorithm=keyalgorithm)
 
     for name in diff.delete:
-        upd.delete(name, "A")
-    for name, ip in diff.update.items():
-        upd.delete(name, "A")
-        upd.add(name, ttl, "A", ip)
-    for name, ip in diff.add.items():
-        upd.add(name, ttl, "A", ip)
+        upd.delete(name, rdtype)
+    for name, value in diff.update.items():
+        upd.delete(name, rdtype)
+        upd.add(name, ttl, rdtype, value)
+    for name, value in diff.add.items():
+        upd.add(name, ttl, rdtype, value)
 
     if dry_run:
         # to_text() includes both the question and update sections
@@ -342,7 +405,7 @@ def apply_diff(
     rcode = response.rcode()
     if rcode != dns.rcode.NOERROR:
         raise RuntimeError(f"DNS UPDATE failed: rcode={dns.rcode.to_text(rcode)}")
-    log.info("applied diff: %s", diff.summary())
+    log.info("applied %s diff: %s", rdtype, diff.summary())
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +418,8 @@ class SyncResult:
     diff: Diff
     desired_count: int
     current_count: int
+    ptr_diff: Diff | None = None
+    ptr_error: str | None = None
     error: str | None = None
 
 
@@ -368,6 +433,7 @@ def sync_once(
     protected: frozenset[str] = frozenset(),
     keyring=None,
     keyalgorithm=dns.tsig.HMAC_SHA256,
+    reverse_zone: str | None = None,
     dry_run: bool = False,
 ) -> SyncResult:
     """One end-to-end pass: build desired, pull current, diff, apply.
@@ -382,6 +448,14 @@ def sync_once(
 
     `keyring` and `keyalgorithm` come from load_tsig_key(); pass them in
     if BIND requires TSIG for transfers and updates (recommended).
+
+    If `reverse_zone` is provided (e.g. ``"178.168.192.in-addr.arpa"``),
+    PTR records are synced in a *separate* UPDATE transaction after the
+    forward sync — RFC 2136 messages target a single zone, so they can't
+    share the transaction. PTR sync is best-effort: a failure there is
+    logged and stored in ``result.ptr_error`` but does not roll back the
+    forward sync. Hosts whose IP doesn't fall inside the reverse zone's
+    /24 are silently skipped (managed elsewhere, not our problem).
     """
     try:
         desired = build_desired(hosts, overrides=overrides)
@@ -402,7 +476,7 @@ def sync_once(
                 keyalgorithm=keyalgorithm,
                 dry_run=dry_run,
             )
-        return SyncResult(
+        result = SyncResult(
             diff=diff, desired_count=len(desired), current_count=len(current)
         )
     except Exception as e:
@@ -413,3 +487,37 @@ def sync_once(
             current_count=0,
             error=str(e),
         )
+
+    if reverse_zone:
+        try:
+            network = reverse_zone_to_network(reverse_zone)
+            desired_ptr = build_desired_ptr(
+                desired,
+                forward_zone=zone,
+                reverse_network=network,
+            )
+            current_ptr = pull_current(
+                reverse_zone,
+                server=server,
+                keyring=keyring,
+                keyalgorithm=keyalgorithm,
+                rdtype="PTR",
+            )
+            ptr_diff = compute_diff(current_ptr, desired_ptr)
+            if not ptr_diff.empty:
+                apply_diff(
+                    ptr_diff,
+                    zone=reverse_zone,
+                    server=server,
+                    ttl=ttl,
+                    keyring=keyring,
+                    keyalgorithm=keyalgorithm,
+                    dry_run=dry_run,
+                    rdtype="PTR",
+                )
+            result.ptr_diff = ptr_diff
+        except Exception as e:
+            log.exception("PTR sync failed (forward sync still applied)")
+            result.ptr_error = str(e)
+
+    return result

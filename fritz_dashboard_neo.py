@@ -66,7 +66,6 @@ logging.basicConfig(
 load_dotenv()
 
 #fmt: off
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -77,10 +76,23 @@ CONFIG = {
     "password":             os.environ.get("FRITZ_PASSWORD", "fritz.box.password"),
     "refresh_seconds":      3,    # how often to poll (overview has fast-refresh)
     "history_points":       120,  # sparkline buffer — 120 × 3s = 6 min window
+
+    # Master switch for the "Sync DNS" button. Defaults to enabled so existing
+    # setups keep working. Set DNS_SYNC_ENABLED=false (or 0/no/off) to disable
+    # the whole feature — TSIG key loading is skipped and the button reports
+    # "disabled" instead of attempting AXFR/UPDATE.
+    "dnssyncenabled":       os.environ.get("DNS_SYNC_ENABLED", "true").strip().lower()
+                            in ("true", "1", "yes", "on"),
     "dnszone":              os.environ.get("DNS_ZONE", "home.lan"),
     "dnsserver":            os.environ.get("DNS_SERVER", "ip.of.your.dns.server"),
+
+    # Optional. If unset, only forward (A) records are synced. Set to the
+    # in-addr.arpa zone name of a /24 reverse zone (e.g. for the
+    # 192.168.178.0/24 subnet, use "178.168.192.in-addr.arpa") to also keep
+    # PTRs in sync. Hosts outside that subnet are silently skipped.
+    "dnsreversezone":       os.environ.get("DNS_REVERSE_ZONE", ""),
     "tsigkey_path":         os.environ.get("TSIG_KEY_PATH", "path.to.tsig.key"),
-    
+
     # MAC -> DNS-label overrides loaded from a YAML file (see
     # dns_overrides.yaml.example). Empty mapping if DNS_OVERRIDES_FILE is
     # unset or the file is missing.
@@ -638,15 +650,19 @@ class FritzDashboard(App):
         tbl.add_columns("Name", "IP", "MAC", "Interface", "Active", "Lease")
 
         # Load TSIG key once — failure is non-fatal; the sync button
-        # will simply surface the error when pressed.
-        try:
-            self._tsig_keyring, self._tsig_algorithm = load_tsig_key(
-                CONFIG["tsigkey_path"]
-            )
-            log.info("loaded TSIG key from %s", CONFIG["tsigkey_path"])
-        except Exception as e:  # noqa: BLE001
-            self._tsig_error = str(e)
-            log.warning("TSIG key not available: %s", e)
+        # will simply surface the error when pressed. Skipped entirely when
+        # sync is disabled so users without a BIND setup aren't nagged.
+        if CONFIG["dnssyncenabled"]:
+            try:
+                self._tsig_keyring, self._tsig_algorithm = load_tsig_key(
+                    CONFIG["tsigkey_path"]
+                )
+                log.info("loaded TSIG key from %s", CONFIG["tsigkey_path"])
+            except Exception as e:  # noqa: BLE001
+                self._tsig_error = str(e)
+                log.warning("TSIG key not available: %s", e)
+        else:
+            log.info("DNS sync disabled via DNS_SYNC_ENABLED; skipping TSIG key load")
 
         # Show the boot sequence first; it will hide itself when done
         self._update_dodge_counter()
@@ -718,6 +734,29 @@ class FritzDashboard(App):
     def _random_quote(self) -> None:
         """Rotate the SUB_TITLE through Matrix quotes."""
         self.sub_title = random.choice(MATRIX_QUOTES)
+
+    def _glitch_in(self, selector: str, text: str, color: str) -> None:
+        """Resolve `text` into the given Label via the standard 4-frame glitch ramp."""
+        label = self.query_one(selector, Label)
+        frames = [
+            (0.0, 0.7),
+            (0.08, 0.45),
+            (0.16, 0.25),
+            (0.24, 0.10),
+            (0.32, 0.0),
+        ]
+
+        def show(intensity: float) -> None:
+            if intensity > 0:
+                label.update(f"[bold {color}]{glitch_text(text, intensity)}[/]")
+            else:
+                label.update(f"[bold {color}]{text}[/]")
+
+        for delay, intensity in frames:
+            if delay <= 0:
+                show(intensity)
+            else:
+                self.set_timer(delay, lambda i=intensity: show(i))
 
     def _update_dodge_counter(self) -> None:
         try:
@@ -1124,25 +1163,7 @@ class FritzDashboard(App):
     def _wake_result_animated(self, final_text: str, kind: str) -> None:
         """Show final text with a brief glitch-in animation."""
         color = "#00ff41" if kind == "ok" else "#ff0040"
-        label = self.query_one("#wake-status", Label)
-
-        # 4 frames of decreasing glitch, then settle
-        frames = [
-            (0.0, 0.7),
-            (0.08, 0.45),
-            (0.16, 0.25),
-            (0.24, 0.10),
-            (0.32, 0.0),
-        ]
-
-        def show(intensity: float) -> None:
-            if intensity > 0:
-                label.update(f"[bold {color}]{glitch_text(final_text, intensity)}[/]")
-            else:
-                label.update(f"[bold {color}]{final_text}[/]")
-
-        for delay, intensity in frames:
-            self.set_timer(delay, lambda i=intensity: show(i))
+        self._glitch_in("#wake-status", final_text, color)
 
     def _wake_result(self, msg: str) -> None:
         self.query_one("#wake-status", Label).update(msg)
@@ -1156,6 +1177,18 @@ class FritzDashboard(App):
     def action_sync_dns(self) -> None:
         """Push the current host list into the andrew.home zone via TSIG-signed DNS UPDATE."""
         status_label = self.query_one("#sync-status", Label)
+
+        if not CONFIG["dnssyncenabled"]:
+            self._glitch_in(
+                "#sync-status",
+                "💊 Blue pill engaged — DNS sync is offline. "
+                "(DNS_SYNC_ENABLED=true to wake up.)",
+                "#008f25",
+            )
+            # Self-clear so a stale disabled banner isn't sitting on the Hosts tab
+            # next time the user comes back to it.
+            self.set_timer(5.0, lambda: status_label.update(""))
+            return
 
         if self._tsig_keyring is None:
             err = self._tsig_error or "no TSIG key loaded"
@@ -1182,50 +1215,46 @@ class FritzDashboard(App):
             protected=CONFIG["protectednames"],
             keyring=self._tsig_keyring,
             keyalgorithm=self._tsig_algorithm,
+            reverse_zone=CONFIG["dnsreversezone"] or None,
         )
         self.call_from_thread(self._sync_result_animated, result)
 
     def _sync_result_animated(self, result) -> None:
         """Display the sync outcome in the same glitch-in style as Wake."""
+        ptr = result.ptr_diff
+        ptr_summary = (
+            f" | PTR {ptr.summary()}" if ptr is not None and not ptr.empty else ""
+        )
+        ptr_note = f" [PTR failed: {result.ptr_error}]" if result.ptr_error else ""
+
         if result.error:
             self.bullets_taken += 1
             text = f"I know kung fu, but: {result.error}"
             kind = "bad"
             log.error("dns sync: %s", result.error)
-        elif result.diff.empty:
-            text = f"✓ Already in the Matrix (current={result.current_count})"
+        elif result.diff.empty and not ptr_summary:
+            text = f"✓ Already in the Matrix (current={result.current_count}){ptr_note}"
             kind = "ok"
             log.info("dns sync: no changes (current=%d)", result.current_count)
         else:
             self.dodged += 1
-            text = f"✓ Synced {result.diff.summary()} (desired={result.desired_count})"
+            text = (
+                f"✓ Synced A {result.diff.summary()}{ptr_summary} "
+                f"(desired={result.desired_count}){ptr_note}"
+            )
             kind = "ok"
             log.info(
-                "dns sync %s (desired=%d, current=%d)",
+                "dns sync A %s%s (desired=%d, current=%d)",
                 result.diff.summary(),
+                ptr_summary,
                 result.desired_count,
                 result.current_count,
             )
+        if result.ptr_error:
+            log.warning("PTR sync error: %s", result.ptr_error)
 
         color = "#00ff41" if kind == "ok" else "#ff0040"
-        label = self.query_one("#sync-status", Label)
-
-        frames = [
-            (0.0, 0.7),
-            (0.08, 0.45),
-            (0.16, 0.25),
-            (0.24, 0.10),
-            (0.32, 0.0),
-        ]
-
-        def show(intensity: float) -> None:
-            if intensity > 0:
-                label.update(f"[bold {color}]{glitch_text(text, intensity)}[/]")
-            else:
-                label.update(f"[bold {color}]{text}[/]")
-
-        for delay, intensity in frames:
-            self.set_timer(delay, lambda i=intensity: show(i))
+        self._glitch_in("#sync-status", text, color)
 
     # -------------------- Explorer tab --------------------
 

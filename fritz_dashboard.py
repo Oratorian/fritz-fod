@@ -66,7 +66,6 @@ log = logging.getLogger("fritzdash")
 load_dotenv()
 
 #fmt: off
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -77,10 +76,23 @@ CONFIG = {
     "password":             os.environ.get("FRITZ_PASSWORD", "fritz.box.password"),
     "refresh_seconds":      3,    # how often to poll (overview has fast-refresh)
     "history_points":       120,  # sparkline buffer — 120 × 3s = 6 min window
+
+    # Master switch for the "Sync DNS" button. Defaults to enabled so existing
+    # setups keep working. Set DNS_SYNC_ENABLED=false (or 0/no/off) to disable
+    # the whole feature — TSIG key loading is skipped and the button reports
+    # "disabled" instead of attempting AXFR/UPDATE.
+    "dnssyncenabled":       os.environ.get("DNS_SYNC_ENABLED", "true").strip().lower()
+                            in ("true", "1", "yes", "on"),
     "dnszone":              os.environ.get("DNS_ZONE", "home.lan"),
     "dnsserver":            os.environ.get("DNS_SERVER", "ip.of.your.dns.server"),
+
+    # Optional. If unset, only forward (A) records are synced. Set to the
+    # in-addr.arpa zone name of a /24 reverse zone (e.g. for the
+    # 192.168.178.0/24 subnet, use "178.168.192.in-addr.arpa") to also keep
+    # PTRs in sync. Hosts outside that subnet are silently skipped.
+    "dnsreversezone":       os.environ.get("DNS_REVERSE_ZONE", ""),
     "tsigkey_path":         os.environ.get("TSIG_KEY_PATH", "path.to.tsig.key"),
-    
+
     # MAC -> DNS-label overrides loaded from a YAML file (see
     # dns_overrides.yaml.example). Empty mapping if DNS_OVERRIDES_FILE is
     # unset or the file is missing.
@@ -512,15 +524,19 @@ class FritzDashboard(App):
         tbl.add_columns("Name", "IP", "MAC", "Interface", "Active", "Lease")
 
         # Load TSIG key once — failure is non-fatal; the sync button
-        # surfaces the error when pressed.
-        try:
-            self._tsig_keyring, self._tsig_algorithm = load_tsig_key(
-                CONFIG["tsigkey_path"]
-            )
-            log.info("loaded TSIG key from %s", CONFIG["tsigkey_path"])
-        except Exception as e:  # noqa: BLE001
-            self._tsig_error = str(e)
-            log.warning("TSIG key not available: %s", e)
+        # surfaces the error when pressed. Skipped entirely when sync is
+        # disabled so users without a BIND setup aren't nagged about it.
+        if CONFIG["dnssyncenabled"]:
+            try:
+                self._tsig_keyring, self._tsig_algorithm = load_tsig_key(
+                    CONFIG["tsigkey_path"]
+                )
+                log.info("loaded TSIG key from %s", CONFIG["tsigkey_path"])
+            except Exception as e:  # noqa: BLE001
+                self._tsig_error = str(e)
+                log.warning("TSIG key not available: %s", e)
+        else:
+            log.info("DNS sync disabled via DNS_SYNC_ENABLED; skipping TSIG key load")
 
         # Connect in a worker so the UI mounts immediately
         self.connect_to_box()
@@ -933,6 +949,12 @@ class FritzDashboard(App):
         """Push the current host list into the configured zone via TSIG-signed DNS UPDATE."""
         status_label = self.query_one("#sync-status", Label)
 
+        if not CONFIG["dnssyncenabled"]:
+            status_label.update(
+                "[#8b949e]DNS sync is disabled (set DNS_SYNC_ENABLED=true to enable).[/]"
+            )
+            return
+
         if self._tsig_keyring is None:
             err = self._tsig_error or "no TSIG key loaded"
             status_label.update(f"[#f85149]✗ TSIG key unavailable: {err}[/]")
@@ -960,29 +982,41 @@ class FritzDashboard(App):
             protected=CONFIG["protectednames"],
             keyring=self._tsig_keyring,
             keyalgorithm=self._tsig_algorithm,
+            reverse_zone=CONFIG["dnsreversezone"] or None,
         )
         self.call_from_thread(self._sync_result, result)
 
     def _sync_result(self, result) -> None:
         """Display sync outcome in the Hosts tab status label."""
         label = self.query_one("#sync-status", Label)
+        ptr = result.ptr_diff
+        ptr_summary = (
+            f" | PTR {ptr.summary()}" if ptr is not None and not ptr.empty else ""
+        )
+        ptr_note = f" [PTR failed: {result.ptr_error}]" if result.ptr_error else ""
+
         if result.error:
             label.update(f"[#f85149]✗ Sync failed: {result.error}[/]")
             log.error("dns sync: %s", result.error)
-        elif result.diff.empty:
-            label.update(f"[#3fb950]✓ Up to date (current={result.current_count})[/]")
+        elif result.diff.empty and not ptr_summary:
+            label.update(
+                f"[#3fb950]✓ Up to date (current={result.current_count}){ptr_note}[/]"
+            )
             log.info("dns sync: no changes (current=%d)", result.current_count)
         else:
             label.update(
-                f"[#3fb950]✓ Synced {result.diff.summary()} "
-                f"(desired={result.desired_count})[/]"
+                f"[#3fb950]✓ Synced A {result.diff.summary()}{ptr_summary} "
+                f"(desired={result.desired_count}){ptr_note}[/]"
             )
             log.info(
-                "dns sync %s (desired=%d, current=%d)",
+                "dns sync A %s%s (desired=%d, current=%d)",
                 result.diff.summary(),
+                ptr_summary,
                 result.desired_count,
                 result.current_count,
             )
+        if result.ptr_error:
+            log.warning("PTR sync error: %s", result.ptr_error)
 
     # -------------------- Explorer tab --------------------
 
